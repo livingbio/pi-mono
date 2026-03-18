@@ -21,7 +21,7 @@ import * as log from "./log.js";
 import { createExecutor, type SandboxConfig } from "./sandbox.js";
 import type { ChannelInfo, SlackContext, UserInfo } from "./slack.js";
 import type { ChannelStore } from "./store.js";
-import { createMomTools, setUploadFunction } from "./tools/index.js";
+import { createMomTools } from "./tools/index.js";
 
 // Hardcoded model for now - TODO: make configurable (issue #63)
 const model = getModel("anthropic", "claude-sonnet-4-5");
@@ -412,8 +412,8 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	const executor = createExecutor(sandboxConfig);
 	const workspacePath = executor.getWorkspacePath(channelDir.replace(`/${channelId}`, ""));
 
-	// Create tools
-	const tools = createMomTools(executor);
+	// Create tools (each runner gets its own attach tool instance with isolated uploadFn)
+	const { tools, setUploadFunction } = createMomTools(executor);
 
 	// Initial system prompt (will be updated each run with fresh memory/channels/users/skills)
 	const memory = getMemory(channelDir);

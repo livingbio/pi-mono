@@ -24,7 +24,7 @@ import type { ChannelStore } from "./store.js";
 import { createMomTools } from "./tools/index.js";
 
 // Hardcoded model for now - TODO: make configurable (issue #63)
-const model = getModel("anthropic", "claude-sonnet-4-5");
+const model = getModel("anthropic", "claude-opus-4-6");
 
 export interface PendingMessage {
 	userName: string;

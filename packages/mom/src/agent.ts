@@ -12,6 +12,7 @@ import {
 	SessionManager,
 	type Skill,
 } from "@mariozechner/pi-coding-agent";
+import { execSync } from "child_process";
 import { existsSync, readFileSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
@@ -64,6 +65,81 @@ const IMAGE_MIME_TYPES: Record<string, string> = {
 
 function getImageMimeType(filename: string): string | undefined {
 	return IMAGE_MIME_TYPES[filename.toLowerCase().split(".").pop() || ""];
+}
+
+const MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024; // Claude API 5MB limit
+
+/**
+ * Read an image file as base64, compressing with ImageMagick if it exceeds the API limit.
+ * Returns { data, mimeType } or null if the image cannot be made small enough.
+ */
+function compressImageIfNeeded(filePath: string, mimeType: string): { data: string; mimeType: string } | null {
+	const data = readFileSync(filePath).toString("base64");
+	if (data.length <= MAX_IMAGE_BASE64_BYTES) {
+		return { data, mimeType };
+	}
+
+	// Try to compress with ImageMagick
+	try {
+		const bin = execSync("command -v magick 2>/dev/null || command -v convert 2>/dev/null", {
+			encoding: "utf-8",
+		})
+			.trim()
+			.split("\n")[0];
+
+		const ratio = MAX_IMAGE_BASE64_BYTES / data.length;
+		const scale = Math.max(10, Math.floor(Math.sqrt(ratio) * 85));
+
+		const attempts = [
+			{ resize: scale, quality: 85 },
+			{ resize: Math.max(10, Math.floor(scale * 0.6)), quality: 70 },
+		];
+
+		const esc = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+
+		for (const { resize, quality } of attempts) {
+			const compressed = execSync(
+				`${esc(bin)} ${esc(filePath)} -resize ${resize}% -quality ${quality} jpeg:- | base64`,
+				{ encoding: "utf-8", maxBuffer: 20 * 1024 * 1024 },
+			).replace(/\s/g, "");
+
+			if (compressed.length <= MAX_IMAGE_BASE64_BYTES) {
+				return { data: compressed, mimeType: "image/jpeg" };
+			}
+		}
+	} catch {
+		// ImageMagick not available or failed
+	}
+
+	return null;
+}
+
+/**
+ * Walk loaded messages and replace any base64 image that exceeds the API limit
+ * with a text placeholder so the session can still be sent to the provider.
+ */
+function sanitizeOversizedImages<T>(messages: T[]): T[] {
+	return messages.map((msg) => {
+		const m = msg as any;
+		if ((m.role === "toolResult" || m.role === "user") && Array.isArray(m.content)) {
+			const hasOversized = m.content.some(
+				(c: any) => c.type === "image" && typeof c.data === "string" && c.data.length > MAX_IMAGE_BASE64_BYTES,
+			);
+			if (hasOversized) {
+				return {
+					...m,
+					content: m.content.map((c: any) => {
+						if (c.type === "image" && typeof c.data === "string" && c.data.length > MAX_IMAGE_BASE64_BYTES) {
+							const sizeMB = (c.data.length / 1024 / 1024).toFixed(1);
+							return { type: "text", text: `[Image removed: ${sizeMB}MB base64 exceeded 5MB API limit]` };
+						}
+						return c;
+					}),
+				};
+			}
+		}
+		return msg;
+	});
 }
 
 function getMemory(channelDir: string): string {
@@ -446,7 +522,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	// Load existing messages
 	const loadedSession = sessionManager.buildSessionContext();
 	if (loadedSession.messages.length > 0) {
-		agent.replaceMessages(loadedSession.messages);
+		agent.replaceMessages(sanitizeOversizedImages(loadedSession.messages));
 		log.logInfo(`[${channelId}] Loaded ${loadedSession.messages.length} messages from context.jsonl`);
 	}
 
@@ -658,7 +734,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			// This picks up any messages synced above
 			const reloadedSession = sessionManager.buildSessionContext();
 			if (reloadedSession.messages.length > 0) {
-				agent.replaceMessages(reloadedSession.messages);
+				agent.replaceMessages(sanitizeOversizedImages(reloadedSession.messages));
 				log.logInfo(`[${channelId}] Reloaded ${reloadedSession.messages.length} messages from context`);
 			}
 
@@ -753,11 +829,12 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 				if (mimeType && existsSync(fullPath)) {
 					try {
-						imageAttachments.push({
-							type: "image",
-							mimeType,
-							data: readFileSync(fullPath).toString("base64"),
-						});
+						const base64 = compressImageIfNeeded(fullPath, mimeType);
+						if (base64) {
+							imageAttachments.push({ type: "image", mimeType: base64.mimeType, data: base64.data });
+						} else {
+							nonImagePaths.push(fullPath);
+						}
 					} catch {
 						nonImagePaths.push(fullPath);
 					}

@@ -5,6 +5,9 @@ import { extname } from "path";
 import type { Executor } from "../sandbox.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateHead } from "./truncate.js";
 
+/** Claude API limit: 5 MB for base64-encoded images */
+const MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024;
+
 /**
  * Map of file extensions to MIME types for common image formats
  */
@@ -54,7 +57,26 @@ export function createReadTool(executor: Executor): AgentTool<typeof readSchema>
 				if (result.code !== 0) {
 					throw new Error(result.stderr || `Failed to read file: ${path}`);
 				}
-				const base64 = result.stdout.replace(/\s/g, ""); // Remove whitespace from base64
+				let base64 = result.stdout.replace(/\s/g, "");
+
+				// Compress if base64 exceeds Claude API 5MB limit
+				if (base64.length > MAX_IMAGE_BASE64_BYTES) {
+					const compressed = await compressImage(executor, path, base64.length, signal);
+					if (compressed) {
+						base64 = compressed;
+					} else {
+						const sizeMB = (base64.length / 1024 / 1024).toFixed(1);
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Image file is too large (${sizeMB}MB base64, max 5MB) and could not be compressed. No image tool (ImageMagick) available. Consider resizing the image manually.`,
+								},
+							],
+							details: undefined,
+						};
+					}
+				}
 
 				return {
 					content: [
@@ -152,6 +174,43 @@ export function createReadTool(executor: Executor): AgentTool<typeof readSchema>
 			};
 		},
 	};
+}
+
+/**
+ * Attempt to compress an image using ImageMagick so it fits under the API base64 limit.
+ * Returns the compressed base64 string, or null if compression is unavailable / still too large.
+ */
+async function compressImage(
+	executor: Executor,
+	path: string,
+	currentBase64Length: number,
+	signal?: AbortSignal,
+): Promise<string | null> {
+	// Detect ImageMagick binary (v7 "magick" or v6 "convert")
+	const check = await executor.exec("command -v magick 2>/dev/null || command -v convert 2>/dev/null", { signal });
+	if (check.code !== 0 || !check.stdout.trim()) return null;
+	const bin = check.stdout.trim().split("\n")[0];
+
+	// Calculate resize percentage: area scales quadratically, so use sqrt.
+	// Apply 0.85 safety margin so we don't just barely miss the limit.
+	const ratio = MAX_IMAGE_BASE64_BYTES / currentBase64Length;
+	const scale = Math.max(10, Math.floor(Math.sqrt(ratio) * 85));
+
+	const attempts = [
+		{ resize: scale, quality: 85 },
+		{ resize: Math.max(10, Math.floor(scale * 0.6)), quality: 70 },
+	];
+
+	for (const { resize, quality } of attempts) {
+		const cmd = `${shellEscape(bin)} ${shellEscape(path)} -resize ${resize}% -quality ${quality} jpeg:- | base64`;
+		const r = await executor.exec(cmd, { signal });
+		if (r.code !== 0) return null;
+
+		const base64 = r.stdout.replace(/\s/g, "");
+		if (base64.length <= MAX_IMAGE_BASE64_BYTES) return base64;
+	}
+
+	return null;
 }
 
 function shellEscape(s: string): string {

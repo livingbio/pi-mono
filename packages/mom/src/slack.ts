@@ -197,6 +197,14 @@ export class SlackBot {
 		await this.webClient.chat.delete({ channel, ts });
 	}
 
+	async setAssistantStatus(channel: string, threadTs: string, status: string): Promise<void> {
+		await this.webClient.assistant.threads.setStatus({
+			channel_id: channel,
+			thread_ts: threadTs,
+			status,
+		});
+	}
+
 	async postInThread(channel: string, threadTs: string, text: string): Promise<string> {
 		const result = await this.webClient.chat.postMessage({ channel, thread_ts: threadTs, text });
 		return result.ts as string;

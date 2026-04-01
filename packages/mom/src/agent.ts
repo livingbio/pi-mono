@@ -673,7 +673,10 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				if (text.trim()) {
 					log.logResponse(logCtx, text);
 					queue.enqueueMessage(text, "main", "response main");
-					queue.enqueueMessage(text, "thread", "response thread", false);
+					// Only overflow to thread for texts that will be truncated in main
+					if (text.length > SLACK_MAX_LENGTH) {
+						queue.enqueueMessage(text, "thread", "response thread", false);
+					}
 				}
 			}
 		} else if (event.type === "compaction_start") {

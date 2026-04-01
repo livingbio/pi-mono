@@ -341,7 +341,6 @@ const handler: MomHandler = {
 // Start
 // ============================================================================
 
-log.initFileLogging(join(workingDir, "logs"));
 log.logStartup(workingDir, sandbox.type === "host" ? "host" : `docker:${sandbox.container}`);
 
 // Shared store for attachment downloads (also used per-channel in getState)

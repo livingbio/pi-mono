@@ -68,47 +68,73 @@ function getImageMimeType(filename: string): string | undefined {
 }
 
 const MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024; // Claude API 5MB limit
+const MAX_IMAGE_DIMENSION = 2000; // Claude API many-image requests dimension limit
 
 /**
- * Read an image file as base64, compressing with ImageMagick if it exceeds the API limit.
+ * Read an image file as base64, compressing with ImageMagick if it exceeds the API limits.
+ * Enforces both the 5MB base64 size limit and the 2000px dimension limit for many-image requests.
  * Returns { data, mimeType } or null if the image cannot be made small enough.
  */
 function compressImageIfNeeded(filePath: string, mimeType: string): { data: string; mimeType: string } | null {
 	const data = readFileSync(filePath).toString("base64");
-	if (data.length <= MAX_IMAGE_BASE64_BYTES) {
+	const sizeOk = data.length <= MAX_IMAGE_BASE64_BYTES;
+
+	const esc = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+
+	// Find ImageMagick binary
+	let bin: string | null = null;
+	try {
+		bin =
+			execSync("command -v magick 2>/dev/null || command -v convert 2>/dev/null", {
+				encoding: "utf-8",
+			})
+				.trim()
+				.split("\n")[0] || null;
+	} catch {
+		// ImageMagick not available
+	}
+
+	// Check dimensions if size is OK (dimensions can be bad even with small files)
+	let dimensionsOk = true;
+	if (sizeOk && bin) {
+		try {
+			const dims = execSync(`${esc(bin)} identify -format "%w %h" ${esc(filePath)}[0]`, {
+				encoding: "utf-8",
+			}).trim();
+			const [w, h] = dims.split(" ").map(Number);
+			if (w > MAX_IMAGE_DIMENSION || h > MAX_IMAGE_DIMENSION) {
+				dimensionsOk = false;
+			}
+		} catch {
+			// identify failed, assume dimensions are ok
+		}
+	}
+
+	if (sizeOk && dimensionsOk) {
 		return { data, mimeType };
 	}
 
-	// Try to compress with ImageMagick
-	try {
-		const bin = execSync("command -v magick 2>/dev/null || command -v convert 2>/dev/null", {
-			encoding: "utf-8",
-		})
-			.trim()
-			.split("\n")[0];
+	if (!bin) {
+		// No ImageMagick: return as-is if size is fine (dimensions can't be fixed)
+		return sizeOk ? { data, mimeType } : null;
+	}
 
-		const ratio = MAX_IMAGE_BASE64_BYTES / data.length;
-		const scale = Math.max(10, Math.floor(Math.sqrt(ratio) * 85));
+	// Compress: cap dimensions at MAX_IMAGE_DIMENSION and reduce quality until size fits
+	const attempts = [{ quality: 85 }, { quality: 70 }, { quality: 55 }];
 
-		const attempts = [
-			{ resize: scale, quality: 85 },
-			{ resize: Math.max(10, Math.floor(scale * 0.6)), quality: 70 },
-		];
-
-		const esc = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-
-		for (const { resize, quality } of attempts) {
+	for (const { quality } of attempts) {
+		try {
 			const compressed = execSync(
-				`${esc(bin)} ${esc(filePath)} -resize ${resize}% -quality ${quality} jpeg:- | base64`,
+				`${esc(bin)} ${esc(filePath)}[0] -resize ${MAX_IMAGE_DIMENSION}x${MAX_IMAGE_DIMENSION}> -quality ${quality} jpeg:- | base64`,
 				{ encoding: "utf-8", maxBuffer: 20 * 1024 * 1024 },
 			).replace(/\s/g, "");
 
 			if (compressed.length <= MAX_IMAGE_BASE64_BYTES) {
 				return { data: compressed, mimeType: "image/jpeg" };
 			}
+		} catch {
+			break;
 		}
-	} catch {
-		// ImageMagick not available or failed
 	}
 
 	return null;

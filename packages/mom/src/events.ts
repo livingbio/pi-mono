@@ -75,6 +75,10 @@ export class EventsWatcher {
 			this.debounce(filename, () => this.handleFileChange(filename));
 		});
 
+		this.watcher.on("error", (err) => {
+			log.logWarning("Events watcher error", String(err));
+		});
+
 		log.logInfo(`Events watcher started, tracking ${this.knownFiles.size} files`);
 	}
 
@@ -301,8 +305,12 @@ export class EventsWatcher {
 	private handlePeriodic(filename: string, event: PeriodicEvent): void {
 		try {
 			const cron = new Cron(event.schedule, { timezone: event.timezone }, () => {
-				log.logInfo(`Executing periodic event: ${filename}`);
-				this.execute(filename, event, false); // Don't delete periodic events
+				try {
+					log.logInfo(`Executing periodic event: ${filename}`);
+					this.execute(filename, event, false); // Don't delete periodic events
+				} catch (err) {
+					log.logWarning(`Error executing periodic event: ${filename}`, String(err));
+				}
 			});
 
 			this.crons.set(filename, cron);

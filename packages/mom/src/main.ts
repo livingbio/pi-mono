@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 
+import "./instrument.js";
+
+import * as Sentry from "@sentry/node";
 import { join, resolve } from "path";
 import { type AgentRunner, getOrCreateRunner } from "./agent.js";
 import { downloadChannel } from "./download.js";
 import { createEventsWatcher } from "./events.js";
 import * as log from "./log.js";
 import { parseSandboxArg, type SandboxConfig, validateSandbox } from "./sandbox.js";
+import { addLifecycleBreadcrumb, applyRunScope } from "./sentry.js";
 import { type MomHandler, type SlackBot, SlackBot as SlackBotClass, type SlackEvent } from "./slack.js";
 import { ChannelStore } from "./store.js";
 
@@ -309,31 +313,60 @@ const handler: MomHandler = {
 		state.running = true;
 		state.stopRequested = false;
 
+		Sentry.metrics.count("agent.run.started", 1, { attributes: { channel: event.channel } });
+		const runStartTime = Date.now();
+
 		log.logInfo(`[${event.channel}] Starting run: ${event.text.substring(0, 50)}`);
 
-		try {
-			// Create context adapter
-			const ctx = createSlackContext(event, slack, state, isEvent);
+		await Sentry.withScope(async (scope) => {
+			applyRunScope(scope, {
+				channelId: event.channel,
+				userId: event.user,
+				userName: slack.getUser(event.user)?.userName,
+				messageTs: event.ts,
+			});
+			addLifecycleBreadcrumb("agent.run.started", { channel: event.channel, is_event: Boolean(isEvent) });
 
-			// Run the agent
-			await ctx.setTyping(true);
-			await ctx.setWorking(true);
-			const result = await state.runner.run(ctx as any, state.store);
-			await ctx.setWorking(false);
+			try {
+				// Create context adapter
+				const ctx = createSlackContext(event, slack, state, isEvent);
 
-			if (result.stopReason === "aborted" && state.stopRequested) {
-				if (state.stopMessageTs) {
-					await slack.updateMessage(event.channel, state.stopMessageTs, "_Stopped_");
-					state.stopMessageTs = undefined;
-				} else {
-					await slack.postMessage(event.channel, "_Stopped_");
+				// Run the agent
+				await ctx.setTyping(true);
+				await ctx.setWorking(true);
+				const result = await state.runner.run(ctx as any, state.store);
+				await ctx.setWorking(false);
+
+				const durationMs = Date.now() - runStartTime;
+				Sentry.metrics.count("agent.run.completed", 1, {
+					attributes: { channel: event.channel, stop_reason: result.stopReason },
+				});
+				Sentry.metrics.distribution("agent.run.duration", durationMs, {
+					unit: "millisecond",
+					attributes: { channel: event.channel },
+				});
+				addLifecycleBreadcrumb("agent.run.completed", {
+					channel: event.channel,
+					stop_reason: result.stopReason,
+					duration_ms: durationMs,
+				});
+
+				if (result.stopReason === "aborted" && state.stopRequested) {
+					if (state.stopMessageTs) {
+						await slack.updateMessage(event.channel, state.stopMessageTs, "_Stopped_");
+						state.stopMessageTs = undefined;
+					} else {
+						await slack.postMessage(event.channel, "_Stopped_");
+					}
 				}
+			} catch (err) {
+				Sentry.captureException(err);
+				Sentry.metrics.count("agent.run.errors", 1, { attributes: { channel: event.channel } });
+				log.logWarning(`[${event.channel}] Run error`, err instanceof Error ? err.message : String(err));
+			} finally {
+				state.running = false;
 			}
-		} catch (err) {
-			log.logWarning(`[${event.channel}] Run error`, err instanceof Error ? err.message : String(err));
-		} finally {
-			state.running = false;
-		}
+		});
 	},
 };
 
@@ -358,15 +391,17 @@ const eventsWatcher = createEventsWatcher(workingDir, bot);
 eventsWatcher.start();
 
 // Handle shutdown
-process.on("SIGINT", () => {
+process.on("SIGINT", async () => {
 	log.logInfo("Shutting down...");
 	eventsWatcher.stop();
+	await Sentry.close(2000);
 	process.exit(0);
 });
 
-process.on("SIGTERM", () => {
+process.on("SIGTERM", async () => {
 	log.logInfo("Shutting down...");
 	eventsWatcher.stop();
+	await Sentry.close(2000);
 	process.exit(0);
 });
 

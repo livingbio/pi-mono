@@ -12,6 +12,7 @@ import {
 	SessionManager,
 	type Skill,
 } from "@mariozechner/pi-coding-agent";
+import * as Sentry from "@sentry/node";
 import { execSync } from "child_process";
 import { existsSync, readFileSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
@@ -625,6 +626,14 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 			const durationMs = pending ? Date.now() - pending.startTime : 0;
 
+			Sentry.metrics.count("agent.tool.calls", 1, {
+				attributes: { tool: agentEvent.toolName, channel: channelId, is_error: agentEvent.isError },
+			});
+			Sentry.metrics.distribution("agent.tool.duration", durationMs, {
+				unit: "millisecond",
+				attributes: { tool: agentEvent.toolName, channel: channelId },
+			});
+
 			if (agentEvent.isError) {
 				log.logToolError(logCtx, agentEvent.toolName, durationMs, resultStr);
 			} else {
@@ -675,6 +684,32 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 					runState.totalUsage.cost.cacheRead += assistantMsg.usage.cost.cacheRead;
 					runState.totalUsage.cost.cacheWrite += assistantMsg.usage.cost.cacheWrite;
 					runState.totalUsage.cost.total += assistantMsg.usage.cost.total;
+
+					Sentry.metrics.count("agent.llm.calls", 1, { attributes: { channel: channelId } });
+					Sentry.metrics.distribution("agent.llm.tokens_in", assistantMsg.usage.input, {
+						unit: "none",
+						attributes: { channel: channelId },
+					});
+					Sentry.metrics.distribution("agent.llm.tokens_out", assistantMsg.usage.output, {
+						unit: "none",
+						attributes: { channel: channelId },
+					});
+					if (assistantMsg.usage.cacheRead > 0) {
+						Sentry.metrics.distribution("agent.llm.cache_read", assistantMsg.usage.cacheRead, {
+							unit: "none",
+							attributes: { channel: channelId },
+						});
+					}
+					if (assistantMsg.usage.cacheWrite > 0) {
+						Sentry.metrics.distribution("agent.llm.cache_write", assistantMsg.usage.cacheWrite, {
+							unit: "none",
+							attributes: { channel: channelId },
+						});
+					}
+					Sentry.metrics.distribution("agent.llm.cost_per_turn", assistantMsg.usage.cost.total, {
+						unit: "none",
+						attributes: { channel: channelId },
+					});
 				}
 
 				const content = agentEvent.message.content;
@@ -950,6 +985,33 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				const summary = log.logUsageSummary(runState.logCtx!, runState.totalUsage, contextTokens, contextWindow);
 				runState.queue.enqueue(() => ctx.respondInThread(summary), "usage summary");
 				await queueChain;
+			}
+
+			if (runState.totalUsage.cost.total > 0) {
+				Sentry.metrics.distribution("agent.run.tokens_in", runState.totalUsage.input, {
+					unit: "none",
+					attributes: { channel: channelId },
+				});
+				Sentry.metrics.distribution("agent.run.tokens_out", runState.totalUsage.output, {
+					unit: "none",
+					attributes: { channel: channelId },
+				});
+				if (runState.totalUsage.cacheRead > 0) {
+					Sentry.metrics.distribution("agent.run.cache_read", runState.totalUsage.cacheRead, {
+						unit: "none",
+						attributes: { channel: channelId },
+					});
+				}
+				if (runState.totalUsage.cacheWrite > 0) {
+					Sentry.metrics.distribution("agent.run.cache_write", runState.totalUsage.cacheWrite, {
+						unit: "none",
+						attributes: { channel: channelId },
+					});
+				}
+				Sentry.metrics.distribution("agent.run.cost", runState.totalUsage.cost.total, {
+					unit: "none",
+					attributes: { channel: channelId },
+				});
 			}
 
 			// Clear run state

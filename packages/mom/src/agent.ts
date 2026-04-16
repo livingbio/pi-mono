@@ -142,23 +142,93 @@ function compressImageIfNeeded(filePath: string, mimeType: string): { data: stri
 }
 
 /**
- * Walk loaded messages and replace any base64 image that exceeds the API limit
- * with a text placeholder so the session can still be sent to the provider.
+ * Parse image dimensions from raw bytes (supports PNG, JPEG, GIF, WebP).
+ * Returns { width, height } or null if the format is unrecognized.
+ */
+function parseImageDimensions(buf: Buffer): { width: number; height: number } | null {
+	// PNG: bytes 16-23 contain width (4 bytes BE) and height (4 bytes BE) in the IHDR chunk
+	if (buf.length >= 24 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+		return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+	}
+
+	// GIF: bytes 6-9 contain width (2 bytes LE) and height (2 bytes LE)
+	if (buf.length >= 10 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) {
+		return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+	}
+
+	// WebP: RIFF....WEBP, then VP8 chunk at offset 12
+	if (buf.length >= 30 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") {
+		const chunk = buf.toString("ascii", 12, 16);
+		if (chunk === "VP8 " && buf.length >= 30) {
+			// Lossy VP8: dimensions at offset 26-29 (little-endian 16-bit, lower 14 bits)
+			return { width: buf.readUInt16LE(26) & 0x3fff, height: buf.readUInt16LE(28) & 0x3fff };
+		}
+		if (chunk === "VP8L" && buf.length >= 25) {
+			// Lossless VP8L: dimensions packed in 4 bytes at offset 21
+			const bits = buf.readUInt32LE(21);
+			return { width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 };
+		}
+	}
+
+	// JPEG: scan for SOF0-SOF3 markers (0xFF 0xC0-0xC3)
+	if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xd8) {
+		let offset = 2;
+		while (offset + 4 < buf.length) {
+			if (buf[offset] !== 0xff) break;
+			const marker = buf[offset + 1];
+			if (marker >= 0xc0 && marker <= 0xc3 && offset + 9 < buf.length) {
+				return { width: buf.readUInt16BE(offset + 7), height: buf.readUInt16BE(offset + 5) };
+			}
+			// Skip this marker segment
+			const segLen = buf.readUInt16BE(offset + 2);
+			offset += 2 + segLen;
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Check if a base64-encoded image exceeds the API limits (size or dimensions).
+ * Returns a removal reason string, or null if the image is OK.
+ */
+function getImageRemovalReason(data: string): string | null {
+	if (data.length > MAX_IMAGE_BASE64_BYTES) {
+		const sizeMB = (data.length / 1024 / 1024).toFixed(1);
+		return `[Image removed: ${sizeMB}MB base64 exceeded 5MB API limit]`;
+	}
+	try {
+		// Only decode the first 64KB to read headers — enough for any format
+		const headerB64 = data.slice(0, 87382); // ~64KB when decoded
+		const buf = Buffer.from(headerB64, "base64");
+		const dims = parseImageDimensions(buf);
+		if (dims && (dims.width > MAX_IMAGE_DIMENSION || dims.height > MAX_IMAGE_DIMENSION)) {
+			return `[Image removed: ${dims.width}x${dims.height} exceeds ${MAX_IMAGE_DIMENSION}px dimension limit for many-image requests]`;
+		}
+	} catch {
+		// Can't parse — keep the image
+	}
+	return null;
+}
+
+/**
+ * Walk loaded messages and replace any base64 image that exceeds the API limits
+ * (size or dimensions) with a text placeholder so the session can still be sent to the provider.
  */
 function sanitizeOversizedImages<T>(messages: T[]): T[] {
 	return messages.map((msg) => {
 		const m = msg as any;
 		if ((m.role === "toolResult" || m.role === "user") && Array.isArray(m.content)) {
 			const hasOversized = m.content.some(
-				(c: any) => c.type === "image" && typeof c.data === "string" && c.data.length > MAX_IMAGE_BASE64_BYTES,
+				(c: any) => c.type === "image" && typeof c.data === "string" && getImageRemovalReason(c.data) !== null,
 			);
 			if (hasOversized) {
 				return {
 					...m,
 					content: m.content.map((c: any) => {
-						if (c.type === "image" && typeof c.data === "string" && c.data.length > MAX_IMAGE_BASE64_BYTES) {
-							const sizeMB = (c.data.length / 1024 / 1024).toFixed(1);
-							return { type: "text", text: `[Image removed: ${sizeMB}MB base64 exceeded 5MB API limit]` };
+						if (c.type === "image" && typeof c.data === "string") {
+							const reason = getImageRemovalReason(c.data);
+							if (reason) return { type: "text", text: reason };
 						}
 						return c;
 					}),

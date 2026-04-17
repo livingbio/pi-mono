@@ -26,7 +26,7 @@ import type { ChannelStore } from "./store.js";
 import { createMomTools } from "./tools/index.js";
 
 // Hardcoded model for now - TODO: make configurable (issue #63)
-const model = getModel("anthropic", "claude-opus-4-6");
+const model = getModel("openai", "gpt-5.4");
 
 export interface PendingMessage {
 	userName: string;
@@ -44,12 +44,12 @@ export interface AgentRunner {
 	abort(): void;
 }
 
-async function getAnthropicApiKey(authStorage: AuthStorage): Promise<string> {
-	const key = await authStorage.getApiKey("anthropic");
+async function getOpenAIApiKey(authStorage: AuthStorage): Promise<string> {
+	const key = await authStorage.getApiKey("openai");
 	if (!key) {
 		throw new Error(
-			"No API key found for anthropic.\n\n" +
-				"Set an API key environment variable, or use /login with Anthropic and link to auth.json from " +
+			"No API key found for openai.\n\n" +
+				"Set an API key environment variable, or use /login with OpenAI and link to auth.json from " +
 				join(homedir(), ".pi", "mom", "auth.json"),
 		);
 	}
@@ -613,7 +613,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			tools,
 		},
 		convertToLlm,
-		getApiKey: async () => getAnthropicApiKey(authStorage),
+		getApiKey: async () => getOpenAIApiKey(authStorage),
 	});
 
 	// Load existing messages
